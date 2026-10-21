@@ -1,8 +1,44 @@
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+import logging
+import os
 import sqlite3
-import bcrypt
+import time
+from logging.handlers import RotatingFileHandler
 from typing import List, Optional
+
+import bcrypt
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
+
+load_dotenv()
+
+LOG_FILE = os.getenv("LOG_FILE", "app.log")
+logger = logging.getLogger("taskmaster")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+if not logger.handlers:
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
 
 app = FastAPI(
     title="TaskMaster API",
@@ -10,7 +46,75 @@ app = FastAPI(
     version="1.0.0"
 )
 
-DATABASE = "taskmaster.db"
+DATABASE = os.getenv("DATABASE_PATH", "taskmaster.db")
+ACCESS_TOKEN_TTL_SECONDS = 60 * 60
+
+
+def _get_token_secret() -> bytes:
+    secret = os.getenv("AUTH_TOKEN_SECRET", "")
+    if len(secret) < 32:
+        raise RuntimeError(
+            "AUTH_TOKEN_SECRET must be configured with at least 32 characters"
+        )
+    return secret.encode("utf-8")
+
+
+def _encode_token_part(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def create_access_token(username: str) -> str:
+    payload = json.dumps(
+        {
+            "sub": username,
+            "exp": int(time.time()) + ACCESS_TOKEN_TTL_SECONDS,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    encoded_payload = _encode_token_part(payload)
+    signature = hmac.new(
+        _get_token_secret(),
+        encoded_payload.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{encoded_payload}.{_encode_token_part(signature)}"
+
+
+def verify_access_token(token: str) -> Optional[str]:
+    try:
+        encoded_payload, encoded_signature = token.split(".", maxsplit=1)
+        supplied_signature = base64.urlsafe_b64decode(
+            encoded_signature + "=" * (-len(encoded_signature) % 4)
+        )
+        expected_signature = hmac.new(
+            _get_token_secret(),
+            encoded_payload.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            return None
+
+        payload_bytes = base64.urlsafe_b64decode(
+            encoded_payload + "=" * (-len(encoded_payload) % 4)
+        )
+        payload = json.loads(payload_bytes)
+        username = payload["sub"]
+        expires_at = payload["exp"]
+        if not isinstance(username, str) or not isinstance(expires_at, int):
+            return None
+        if expires_at <= int(time.time()):
+            return None
+        return username
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+        UnicodeDecodeError,
+        binascii.Error,
+        json.JSONDecodeError,
+    ):
+        return None
 
 
 def init_db():
@@ -41,6 +145,7 @@ def init_db():
 
 
 init_db()
+logger.info("TaskMaster API initialized")
 
 
 class UserSchema(BaseModel):
@@ -69,21 +174,45 @@ class TaskResponse(BaseModel):
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
+        logger.warning("Request rejected: missing or invalid bearer authorization")
         raise HTTPException(status_code=401, detail="Отсутствует или неверный токен авторизации")
 
-    token = authorization.replace("Bearer ", "")
+    username = verify_access_token(authorization.removeprefix("Bearer "))
+    if not username:
+        logger.warning("Request rejected: invalid or expired bearer token")
+        raise HTTPException(status_code=401, detail="Недействительный или просроченный токен")
+
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, username FROM users WHERE username = ?", (token,))
+    cursor.execute("SELECT id, username FROM users WHERE username = ?", (username,))
     user = cursor.fetchone()
     conn.close()
 
     if not user:
+        logger.warning("Request rejected: token subject does not exist")
         raise HTTPException(
             status_code=401,
             detail="Недействительный токен / пользователь не найден")
 
     return {"id": user[0], "username": user[1]}
+
+
+@app.middleware("http")
+async def log_unhandled_exceptions(request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.exception(
+            "Unhandled error while processing %s %s",
+            request.method,
+            request.url.path,
+        )
+        raise
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/register", summary="Регистрация пользователя")
@@ -100,9 +229,11 @@ def register(user: UserSchema):
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
+        logger.warning("Registration rejected: username already exists")
         raise HTTPException(status_code=400, detail="Пользователь с таким именем уже существует")
 
     conn.close()
+    logger.info("User registration succeeded")
     return {"message": "Пользователь успешно зарегистрирован"}
 
 
@@ -115,9 +246,14 @@ def login(user: UserSchema):
     conn.close()
 
     if not row or not bcrypt.checkpw(user.password.encode("utf-8"), row[0]):
+        logger.warning("Login rejected: invalid credentials")
         raise HTTPException(status_code=401, detail="Неверное имя пользователя или пароль")
 
-    return {"token": f"Bearer {user.username}", "token_type": "bearer"}
+    logger.info("User login succeeded")
+    return {
+        "token": create_access_token(user.username),
+        "token_type": "bearer",
+    }
 
 
 @app.get("/tasks", response_model=List[TaskResponse],

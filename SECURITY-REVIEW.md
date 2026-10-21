@@ -8,35 +8,35 @@
 
 | Requirement | Result | Evidence |
 |---|---|---|
-| `GET /health` returns `{"status": "ok"}` | Not implemented | `main.py` defines no `/health` route. Add a small unauthenticated health route returning the required JSON. |
-| INFO/WARNING/ERROR logs to console and file | Not configured | The application does not configure Python logging, add `StreamHandler`/`FileHandler`, or emit application logs. Uvicorn's default logging is not a substitute for the requested application logging configuration. |
-| Secrets stored outside source in `.env` | No `.env` found | There is no `.env` or `.env.example` in the project. `python-dotenv` is present in `requirements.txt`, but the application does not load it. No hardcoded API keys or real credentials were found in the inspected source. |
+| `GET /health` returns `{"status": "ok"}` | Implemented after the initial review | `/health` now returns the required JSON without authentication. |
+| INFO/WARNING/ERROR logs to console and file | Implemented after the initial review | The `taskmaster` logger writes INFO and higher to a console handler and a rotating file handler. |
+| Secrets stored outside source in `.env` | Implemented after the initial review | `.env` is ignored by Git; `.env.example` documents required configuration. The local signing secret is not committed. |
 
 ## Findings
 
-### High — Authentication token is the username, and login returns a fixed placeholder
+### High — Authentication token was the username, and login returned a fixed placeholder
 
 **Locations:** `main.py:74-77`, `main.py:120`
 
-The authentication dependency treats the bearer token as a username and looks up that username directly. Usernames are not secrets, so anyone who knows a username can construct an accepted bearer value. In addition, login returns the same literal `"******"` for every successful login; that value is not a per-user credential and does not establish a secure authenticated session.
+The initial implementation treated the bearer token as a username and returned the username as the login token. Usernames are not secrets, so anyone who knew a username could construct an accepted bearer value.
 
-**Recommendation:** Replace this scheme with a cryptographically random, expiring token or a properly signed token with validated claims. Return it only after successful login; verify its signature, expiry, and subject on protected routes. Revoke/rotate credentials as appropriate.
+**Status:** The current implementation issues an HMAC-SHA256-signed token with an expiry, validates its signature and subject on protected routes, and requires `AUTH_TOKEN_SECRET` from the environment. Existing tokens from the former scheme are no longer accepted.
 
-### Medium — Plain HTTP is documented and the container listens on all interfaces
+### Medium — Network deployment still needs TLS
 
-**Locations:** `Dockerfile:17`, `README.md:25,28`
+**Locations:** `Dockerfile:17`, `README.md` Docker instructions
 
-Uvicorn binds to `0.0.0.0`, and the documented Docker command publishes the service on the host without binding it specifically to loopback. The documented URL uses HTTP. If reachable by other machines, credentials and bearer tokens can be observed in transit.
+Uvicorn listens on all container interfaces. The documented Docker command now publishes only on host loopback, which is suitable for local development. If the container is exposed directly to a network, credentials and bearer tokens would be sent over plain HTTP.
 
-**Recommendation:** For local-only development, publish with `127.0.0.1:8000:8000`. For a network-facing deployment, terminate TLS at a trusted reverse proxy and do not expose the plaintext application port publicly.
+**Recommendation:** Keep the documented loopback-only binding for local use. For a network-facing deployment, terminate TLS at a trusted reverse proxy and do not expose the plaintext application port publicly.
 
 ### Medium — SQLite database files are tracked by Git
 
-**Locations:** repository root: `taskmaster.db`, `users.db` (both tracked)
+**Locations:** repository root: `taskmaster.db`, `users.db` (were tracked at the time of the initial review)
 
 Database files committed to a repository may expose personal data, task contents, or password hashes if those records are present. Removing a database from the latest commit does not remove it from Git history.
 
-**Recommendation:** Do not commit runtime databases. Add both filenames to `.gitignore`; if either contains real data, treat it as disclosed, rotate affected credentials where relevant, and remove the data from repository history using the project's approved process.
+**Recommendation / status:** Both files are now excluded by `.gitignore` and untracked in the current changes. Their copies remain in earlier Git history; if they contain real data, treat it as disclosed, rotate affected credentials where relevant, and remove the data from repository history using the project's approved process.
 
 ### Low — No login throttling or password policy is visible
 
@@ -46,13 +46,13 @@ Registration accepts the supplied password without an explicit length policy, an
 
 **Recommendation:** Enforce an appropriate password length policy and add rate limiting/lockout protections at the application or trusted gateway layer. Avoid revealing whether a username exists in authentication error messages.
 
-### Low — File logging requirements are unmet
+### Low — File logging requirements were unmet at initial review
 
 **Locations:** `main.py` (application-wide)
 
-There are no application log calls or configured handlers, so operational failures and security-relevant events are not captured in the requested console and file destinations.
+The initial version had no application log calls or configured handlers. The current changes add console and rotating file handlers, INFO logs for successful actions, WARNING logs for rejected requests, and ERROR-level exception logging for unhandled errors.
 
-**Recommendation:** Configure a single logger with `StreamHandler` and `FileHandler`, set the intended levels/format, and log relevant events without passwords, bearer tokens, or other secrets. Ensure log files have restricted permissions and a rotation/retention policy.
+**Remaining recommendation:** The application logger uses a rotating file handler and logs messages without passwords or bearer tokens. For production, also ensure log files have restricted permissions and the configured retention policy meets operational requirements.
 
 ## Additional notes
 
